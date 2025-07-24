@@ -1,4 +1,4 @@
-#!/Users/user/Desktop/python-workspace/GUI/myvenv/bin/python3.11
+#!/Users/user/Downloads/CS-workspace/GUI-for-upload_new/myvenv/bin/python3.11
 
 import sys
 import json

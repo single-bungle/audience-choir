@@ -38,7 +38,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV="/Users/user/Desktop/python-workspace/GUI/myvenv"
+VIRTUAL_ENV="/Users/user/Downloads/CS-workspace/GUI-for-upload_new/myvenv"
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"

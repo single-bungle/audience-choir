@@ -1,0 +1,30 @@
+# Python 가상환경
+myvenv/
+venv/
+
+# Checkpoints 폴더 무시
+checkpoints/
+
+# __pycache__ 디렉토리
+__pycache__/
+*.py[cod]
+
+# Jupyter Notebook 체크포인트
+.ipynb_checkpoints/
+
+# 환경 변수 파일
+.env
+
+# macOS 시스템 파일
+.DS_Store
+
+# 로그 파일
+*.log
+
+# 파이썬 빌드 아티팩트
+build/
+dist/
+*.egg-info/
+
+# VSCode 설정 파일
+.vscode/
