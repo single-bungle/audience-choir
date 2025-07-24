@@ -9,15 +9,17 @@ from argparse import Namespace
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QFileDialog, QLabel, QAbstractItemView,
     QFormLayout, QLineEdit, QSpinBox, QVBoxLayout, QHBoxLayout, QDoubleSpinBox, QCheckBox, 
-    QListWidget, QListWidgetItem, QSlider, QScrollArea
+    QListWidget, QListWidgetItem, QSlider, QScrollArea, QProgressBar
 )
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-from PyQt5.QtCore import QUrl, Qt, QPoint
+from PyQt5.QtCore import QUrl, Qt, QPoint, QThread, pyqtSignal
 from PyQt5.QtGui import QPainter, QColor, QFont, QPen
 from pydub import AudioSegment
 import librosa
 from scipy.signal import fftconvolve
 import pyloudnorm as pyln
+import gc
+
 
 # 모델 코드가 있는 디렉토리를 import 경로에 추가
 sys.path.append(os.path.join(os.path.dirname(__file__), 'seed_vc'))
@@ -93,6 +95,115 @@ def interpolated_brir(brir_type, input_location):
     interpolated_hrir_R = (1 - t) * hrir_1_R + t * hrir_2_R
     
     return interpolated_hrir_L, interpolated_hrir_R, sr_hrir_1
+
+class ConversionWorker(QThread):
+    progress = pyqtSignal(str)
+    progress_value = pyqtSignal(int)
+    finished = pyqtSignal(list, float)
+    error = pyqtSignal(str)
+
+    def __init__(self, args, parent=None):
+        super().__init__(parent)
+        self.args = args
+
+    def run(self):
+        from seed_vc import inference
+        import glob
+        from pydub import AudioSegment
+
+        start_time = time.time()
+        converted_files = []
+        total_targets = len(self.args.targets)
+        try:
+            os.makedirs(self.args.output, exist_ok=True)
+            print(f"Output directory created: {self.args.output}")
+            for idx, t_path in enumerate(self.args.targets):
+                self.args.target = t_path
+                target_filename = os.path.basename(t_path)
+                self.progress.emit(f"{target_filename} 변환 중...")
+                print(f"Converting: {target_filename}, Source: {self.args.source}, Target: {t_path}")
+                print(f"Args: {vars(self.args)}")
+                try:
+                    inference(self.args)
+                    output_files = glob.glob(os.path.join(self.args.output, "*.wav"))
+                    print(f"Output files found: {output_files}")
+                    self.progress.emit(f"출력 파일: {output_files}")
+                    if not output_files:
+                        self.progress.emit(f"{target_filename}에 대한 출력 오디오 파일이 없습니다.")
+                        print(f"No output files for {target_filename}")
+                        continue
+                    latest_file = max(output_files, key=os.path.getmtime)
+                    print(f"Latest file: {latest_file}")
+                    self.progress.emit(f"최신 파일: {latest_file}")
+                    audio = AudioSegment.from_wav(latest_file)
+                    normalized_audio = self.parent().normalize_audio_power(audio)
+                    normalized_file = os.path.join(tempfile.gettempdir(), f"normalized_{target_filename}")
+                    normalized_audio.export(normalized_file, format="wav")
+                    converted_files.append((normalized_file, target_filename, normalized_audio))
+                    progress_percentage = int(((idx + 1) / total_targets) * 100)
+                    self.progress_value.emit(progress_percentage)
+                except Exception as e:
+                    self.progress.emit(f"{target_filename} 변환 실패: {str(e)}")
+                    print(f"Error during inference for {target_filename}: {str(e)}")
+                    continue
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            if not converted_files:
+                self.progress.emit(f"변환된 오디오 파일이 없습니다. (소요 시간: {elapsed_time:.2f}초)")
+                print(f"No converted files. Total time: {elapsed_time:.2f} seconds")
+            else:
+                self.progress.emit(f"변환 완료. 파일 수: {len(converted_files)} (소요 시간: {elapsed_time:.2f}초)")
+                print(f"Conversion completed. Files: {len(converted_files)}, Total time: {elapsed_time:.2f} seconds")
+            self.finished.emit(converted_files, elapsed_time)
+        except Exception as e:
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            self.error.emit(f"일반 오류: {str(e)} (소요 시간: {elapsed_time:.2f}초)")
+            print(f"General error: {str(e)}, Total time: {elapsed_time:.2f} seconds")
+
+class SpatialAudioWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(list, float)
+    error = pyqtSignal(str)
+
+    def __init__(self, converted_files, circle_positions, parent=None):
+        super().__init__(parent)
+        self.converted_files = converted_files
+        self.circle_positions = circle_positions
+
+    def run(self):
+        start_time = time.time()
+        new_converted_files = []
+
+        try:
+            for normalized_file, target_filename, normalized_audio in self.converted_files:
+                name_without_ext = os.path.splitext(target_filename)[0]
+                if name_without_ext not in self.circle_positions:
+                    self.progress.emit(f"{target_filename}에 대한 좌표가 없습니다.")
+                    continue
+
+                lon, lat = self.circle_positions[name_without_ext]
+                self.progress.emit(f"{target_filename}에 공간 음향 적용 중...")
+                audio_data, sr = librosa.load(normalized_file, sr=None, mono=True)
+                convolved_file, convolved_signal = self.parent().apply_brir_convolution(audio_data, sr, lon, lat, target_filename)
+                convolved_audio = AudioSegment.from_wav(convolved_file)
+                new_converted_files.append((convolved_file, target_filename, convolved_audio))
+
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+
+            if not new_converted_files:
+                self.progress.emit(f"공간 음향이 적용된 오디오 파일이 없습니다. (소요 시간: {elapsed_time:.2f}초)")
+                self.finished.emit([], elapsed_time)
+            else:
+                self.finished.emit(new_converted_files, elapsed_time)
+
+        except Exception as e:
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            self.error.emit(f"공간 음향 적용 오류: {str(e)} (소요 시간: {elapsed_time:.2f}초)")
+        finally:
+            gc.collect()
 
 class TargetAudioControl(QWidget):
     def __init__(self, title, visualizer):
@@ -281,9 +392,9 @@ class DraggableTargetCircle(QWidget):
             painter.drawLine(int(x), 0, int(x), h)
             painter.setFont(QFont("Arial", 8))
             painter.setPen(Qt.darkGray)
-            painter.drawText(int(x) , h - 15, 20, 20, Qt.AlignCenter, str(lon))
+            painter.drawText(int(x), h - 15, 20, 20, Qt.AlignCenter, str(lon))
 
-        for lat in range(self.logic_y_range[0], self.logic_y_range[1] , grid_spacing_deg):
+        for lat in range(self.logic_y_range[0], self.logic_y_range[1], grid_spacing_deg):
             y = origin_y - lat * scale_y
             painter.drawLine(0, int(y), w, int(y))
             painter.setFont(QFont("Arial", 8))
@@ -371,59 +482,52 @@ class ChorusAudioControl(QWidget):
     def __init__(self, title):
         super().__init__()
         self.media_player = QMediaPlayer()
-        self.chorus_files = []
-        self.chorus_audio_dict = {}
+        self.audio_path = None
+        self.audio_data = None
 
-        self.list_widget = QListWidget()
         self.play_button = QPushButton("Play Chorus")
         self.stop_button = QPushButton("Stop Chorus")
+        self.volume_label = QLabel("Chorus Volume: 1.00")
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 200)
+        self.volume_slider.setValue(100)
+        self.volume_slider.valueChanged.connect(self.update_volume)
         self.label = QLabel("No chorus audio available.")
 
         self.play_button.clicked.connect(self.play_audio)
         self.stop_button.clicked.connect(self.stop_audio)
-        self.list_widget.itemClicked.connect(self.select_audio)
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel(f"<b>{title}</b>"))
-        layout.addWidget(self.list_widget)
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.play_button)
         button_layout.addWidget(self.stop_button)
 
+        volume_layout = QHBoxLayout()
+        volume_layout.addWidget(self.volume_label)
+        volume_layout.addWidget(self.volume_slider)
+
         layout.addLayout(button_layout)
+        layout.addLayout(volume_layout)
         layout.addWidget(self.label)
         self.setLayout(layout)
 
-        self.current_selected_path = None
-
     def add_chorus_audio(self, file_path, audio_segment):
-        filename = os.path.basename(file_path)
-        self.chorus_files.clear()
-        self.chorus_audio_dict.clear()
-        self.list_widget.clear()
+        self.audio_path = file_path
+        self.audio_data = audio_segment
+        self.label.setText(f"Loaded: {os.path.basename(file_path)}")
+        self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(file_path)))
 
-        self.chorus_files.append(file_path)
-        item = QListWidgetItem(f"Chorus: {filename}")
-        item.setData(Qt.UserRole, file_path)
-        self.list_widget.addItem(item)
-        self.chorus_audio_dict[file_path] = audio_segment
-        self.label.setText(f"{len(self.chorus_files)} chorus file available.")
-
-    def select_audio(self, item):
-        file_path = item.data(Qt.UserRole)
-        if file_path and os.path.isfile(file_path):
-            self.current_selected_path = file_path
-            self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(file_path)))
+    def update_volume(self):
+        volume = self.volume_slider.value() / 100.0
+        self.volume_label.setText(f"Chorus Volume: {volume:.2f}")
+        self.media_player.setVolume(int(volume * 100))
 
     def play_audio(self):
-        if not self.current_selected_path:
-            if self.chorus_files:
-                self.current_selected_path = self.chorus_files[-1]
-                self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.current_selected_path)))
-            else:
-                self.label.setText("No chorus audio selected.")
-                return
+        if not self.audio_path:
+            self.label.setText("No chorus audio available.")
+            return
 
         if self.media_player.state() == QMediaPlayer.PlayingState:
             self.media_player.pause()
@@ -436,6 +540,68 @@ class ChorusAudioControl(QWidget):
         self.media_player.stop()
         self.play_button.setText("Play Chorus")
 
+class SpatialChorusControl(QWidget):
+    def __init__(self, title):
+        super().__init__()
+        self.media_player = QMediaPlayer()
+        self.audio_path = None
+        self.audio_data = None
+
+        self.play_button = QPushButton("Play Spatial Chorus")
+        self.stop_button = QPushButton("Stop Spatial Chorus")
+        self.volume_label = QLabel("Spatial Chorus Volume: 1.00")
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 200)
+        self.volume_slider.setValue(100)
+        self.volume_slider.valueChanged.connect(self.update_volume)
+        self.label = QLabel("No spatial chorus audio available.")
+
+        self.play_button.clicked.connect(self.play_audio)
+        self.stop_button.clicked.connect(self.stop_audio)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel(f"<b>{title}</b>"))
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.play_button)
+        button_layout.addWidget(self.stop_button)
+
+        volume_layout = QHBoxLayout()
+        volume_layout.addWidget(self.volume_label)
+        volume_layout.addWidget(self.volume_slider)
+
+        layout.addLayout(button_layout)
+        layout.addLayout(volume_layout)
+        layout.addWidget(self.label)
+        self.setLayout(layout)
+
+    def add_spatial_chorus_audio(self, file_path, audio_segment):
+        self.audio_path = file_path
+        self.audio_data = audio_segment
+        self.label.setText(f"Loaded: {os.path.basename(file_path)}")
+        self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(file_path)))
+
+    def update_volume(self):
+        volume = self.volume_slider.value() / 100.0
+        self.volume_label.setText(f"Spatial Chorus Volume: {volume:.2f}")
+        self.media_player.setVolume(int(volume * 100))
+
+    def play_audio(self):
+        if not self.audio_path:
+            self.label.setText("No spatial chorus audio available.")
+            return
+
+        if self.media_player.state() == QMediaPlayer.PlayingState:
+            self.media_player.pause()
+            self.play_button.setText("Play Spatial Chorus")
+        else:
+            self.media_player.play()
+            self.play_button.setText("Pause Spatial Chorus")
+
+    def stop_audio(self):
+        self.media_player.stop()
+        self.play_button.setText("Play Spatial Chorus")
+
 class AudioPlayer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -445,7 +611,8 @@ class AudioPlayer(QMainWindow):
         self.visualizer = DraggableTargetCircle()
         self.audio_target = TargetAudioControl("Target", self.visualizer)
         self.audio_source = SourceAudioControl("Source")
-        self.chorus_control = ChorusAudioControl("Chorus")
+        self.chorus_control = ChorusAudioControl("Chorus (Non-Spatial)")
+        self.spatial_chorus_control = SpatialChorusControl("Spatial Chorus")
 
         self.converted_player = QMediaPlayer()
         
@@ -460,22 +627,28 @@ class AudioPlayer(QMainWindow):
         self.volume_sliders = {}
         self.volume_values = {}
 
-        self.chorus_volume_label = QLabel("Chorus Volume: 1.0")
-        self.chorus_volume_slider = QSlider(Qt.Horizontal)
-        self.chorus_volume_slider.setRange(0, 200)
-        self.chorus_volume_slider.setValue(100)
-        self.chorus_volume_slider.valueChanged.connect(self.update_chorus_volume)
-
         self.convert_button = QPushButton("Convert")
-        self.convert_button.clicked.connect(self.convert_and_play)
+        self.convert_button.clicked.connect(self.start_conversion_thread)
+
+        self.estimated_time_label = QLabel("Estimated Inference Time: N/A")
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("Conversion Progress: %p%")
 
         self.spatial_button = QPushButton("Apply Spatial Audio")
-        self.spatial_button.clicked.connect(self.apply_spatial_audio)
+        self.spatial_button.clicked.connect(self.start_spatial_audio_thread)
         self.spatial_button.setEnabled(False)
 
         self.save_button = QPushButton("Save Converted Audio")
         self.save_button.clicked.connect(self.save_audio)
         self.save_button.setEnabled(False)
+
+        self.save_spatial_button = QPushButton("Save Spatial Audio")
+        self.save_spatial_button.clicked.connect(self.save_spatial_audio)
+        self.save_spatial_button.setEnabled(False)
 
         self.result_label = QLabel("No output yet.")
 
@@ -489,6 +662,9 @@ class AudioPlayer(QMainWindow):
         left_layout.addWidget(self.audio_source)
         left_layout.addWidget(QLabel("<b>Conversion Settings</b>"))
         left_layout.addLayout(self.config_form)
+        left_layout.addWidget(self.convert_button)
+        left_layout.addWidget(self.estimated_time_label)
+        left_layout.addWidget(self.progress_bar)
         left_layout.addStretch()
         left_widget.setLayout(left_layout)
         left_panel.setWidget(left_widget)
@@ -501,12 +677,11 @@ class AudioPlayer(QMainWindow):
         right_layout.addWidget(self.visualizer)
         right_layout.addWidget(QLabel("<b>Converted Audio</b>"))
         right_layout.addWidget(self.converted_audio_list)
-        right_layout.addWidget(self.chorus_volume_label)
-        right_layout.addWidget(self.chorus_volume_slider)
         right_layout.addWidget(self.chorus_control)
-        right_layout.addWidget(self.convert_button)
+        right_layout.addWidget(self.spatial_chorus_control)
         right_layout.addWidget(self.spatial_button)
         right_layout.addWidget(self.save_button)
+        right_layout.addWidget(self.save_spatial_button)
         right_layout.addWidget(self.result_label)
         right_layout.addStretch()
         right_widget.setLayout(right_layout)
@@ -519,48 +694,67 @@ class AudioPlayer(QMainWindow):
         container.setLayout(main_layout)
         self.setCentralWidget(container)
 
-        self.setStyleSheet("""
-            QWidget { font-size: 12px; }
-            QPushButton { padding: 5px; }
-            QLineEdit, QSpinBox, QDoubleSpinBox { max-width: 300px; }
-            QListWidget { max-height: 200px; }
-        """)
+        self.audio_source.upload_button.clicked.connect(self.update_estimated_time)
+        self.audio_target.upload_button.clicked.connect(self.update_estimated_time)
+        self.audio_target.list_widget.itemChanged.connect(self.update_estimated_time)
+
+    def update_estimated_time(self):
+        try:
+            source_path = self.audio_source.current_selected_path
+            if not source_path or not os.path.isfile(source_path):
+                self.estimated_time_label.setText("Estimated Inference Time: N/A")
+                return
+
+            source_audio = AudioSegment.from_wav(source_path)
+            source_duration = len(source_audio) / 1000.0
+
+            checked_targets = []
+            for i in range(self.audio_target.list_widget.count()):
+                item = self.audio_target.list_widget.item(i)
+                if item.checkState() == Qt.Checked:
+                    filename = item.text()
+                    target_path = next((path for path in self.audio_target.audio_files if os.path.basename(path) == filename), None)
+                    if target_path and os.path.isfile(target_path):
+                        checked_targets.append(target_path)
+
+            if not checked_targets:
+                self.estimated_time_label.setText("Estimated Inference Time: N/A")
+                return
+
+            target_durations = []
+            for target_path in checked_targets:
+                target_audio = AudioSegment.from_wav(target_path)
+                target_durations.append(len(target_audio) / 1000.0)
+
+            total_target_duration = sum(target_durations)
+            num_targets = len(checked_targets)
+
+            estimated_time = 3.4 * total_target_duration + 4 * source_duration * num_targets
+            self.estimated_time_label.setText(f"Estimated Inference Time: {estimated_time:.2f} seconds")
+        except Exception as e:
+            self.estimated_time_label.setText(f"Estimated Inference Time: Error ({str(e)})")
 
     def create_config_form(self):
-        self.source_input = QLineEdit("./examples/source/source_s1.wav")
-        self.target_input = QListWidget()
-        self.target_input.setSelectionMode(QAbstractItemView.MultiSelection)
-        self.target_input.setDragDropMode(QAbstractItemView.InternalMove)
-
-        self.target_audio_paths = []
         self.output_input = QLineEdit("./reconstructed")
-
         self.diffusion_steps_input = QSpinBox()
         self.diffusion_steps_input.setValue(50)
-
         self.length_adjust_input = QDoubleSpinBox()
         self.length_adjust_input.setValue(1.0)
-
         self.inference_cfg_input = QDoubleSpinBox()
         self.inference_cfg_input.setValue(1.0)
-
         self.f0_condition_input = QCheckBox()
-        self.f0_condition_input.setChecked(False)
+        self.f0_condition_input.setChecked(True)
         self.auto_f0_adjust_input = QCheckBox()
         self.auto_f0_adjust_input.setChecked(False)
         self.fp16_input = QCheckBox()
         self.fp16_input.setChecked(True)
-
         self.semitone_shift_input = QSpinBox()
         self.semitone_shift_input.setRange(-24, 24)
         self.semitone_shift_input.setValue(0)
-
         self.checkpoint_input = QLineEdit()
         self.config_input = QLineEdit()
 
         form = QFormLayout()
-        form.addRow("Source Path", self.source_input)
-        form.addRow("Target Files", self.target_input)
         form.addRow("Output Dir", self.output_input)
         form.addRow("Diffusion Steps", self.diffusion_steps_input)
         form.addRow("Length Adjust", self.length_adjust_input)
@@ -593,58 +787,122 @@ class AudioPlayer(QMainWindow):
         )
         return normalized_audio
 
-    def update_chorus(self):
-        if len(self.converted_files) < 1:
+    def update_non_spatial_chorus(self):
+        if not self.original_converted_files:
+            self.chorus_control.label.setText("No chorus audio available.")
             return
 
-        combined = None
-        max_len = max(len(audio) for _, _, audio in self.converted_files)
-        headroom_db = -6.0  # Increased headroom to prevent clipping
+        try:
+            max_len = max(len(audio) for _, _, audio in self.original_converted_files)
+            headroom_db = -6.0
+            sr = self.original_converted_files[0][2].frame_rate
 
-        # Normalize and apply volume adjustments for each audio
-        normalized_audios = []
-        for file_path, target_filename, audio in self.converted_files:
-            volume = self.volume_values.get(file_path, 1.0)
-            adjusted_audio = audio + (20 * np.log10(volume))
+            combined_samples = np.zeros(max_len * sr // 1000, dtype=np.float32)
+            num_audios = len(self.original_converted_files)
 
-            if len(adjusted_audio) < max_len:
-                adjusted_audio = adjusted_audio + AudioSegment.silent(duration=max_len - len(adjusted_audio))
-
-            samples = np.array(adjusted_audio.get_array_of_samples())
-            if adjusted_audio.channels == 2:
-                samples = samples.reshape((-1, 2))
-            sr = audio.frame_rate
+            for file_path, target_filename, audio in self.original_converted_files:
+                volume = self.volume_values.get(file_path, 1.0)
+                samples = np.array(audio.get_array_of_samples()).astype(np.float32) / 32768.0
+                if audio.channels == 2:
+                    samples = samples.reshape((-1, 2)).mean(axis=1)
+                if len(samples) < len(combined_samples):
+                    samples = np.pad(samples, (0, len(combined_samples) - len(samples)), mode='constant')
+                elif len(samples) > len(combined_samples):
+                    samples = samples[:len(combined_samples)]
+                combined_samples += samples * volume * 0.5 / num_audios  # 50% amplitude per audio
 
             meter = pyln.Meter(sr)
-            loudness = meter.integrated_loudness(samples.mean(axis=1) if samples.ndim > 1 else samples)
-            normalized_samples = pyln.normalize.loudness(samples, loudness, -23.0)
+            loudness = meter.integrated_loudness(combined_samples)
+            normalized_samples = pyln.normalize.loudness(combined_samples, loudness, -23.0)
             normalized_samples = (normalized_samples * 32768).astype(np.int16)
-            normalized_audio = AudioSegment(
+
+            combined_audio = AudioSegment(
                 normalized_samples.tobytes(),
                 frame_rate=sr,
                 sample_width=2,
-                channels=2 if samples.ndim > 1 else 1
+                channels=1
             )
-            normalized_audios.append(normalized_audio)
 
-        # Combine normalized audios with clipping prevention
-        combined = normalized_audios[0]
-        for audio in normalized_audios[1:]:
-            combined = combined.overlay(audio, gain_during_overlay=-3.0)  # Apply slight gain reduction during overlay
+            if combined_audio.max_dBFS > headroom_db:
+                gain_adjust = headroom_db - combined_audio.max_dBFS
+                combined_audio = combined_audio.apply_gain(gain_adjust)
 
-        chorus_volume = self.chorus_volume_slider.value() / 100.0
-        combined = combined + (20 * np.log10(chorus_volume))
+            combined_file = os.path.join(tempfile.gettempdir(), "non_spatial_chorus.wav")
+            combined_audio.export(combined_file, format="wav")
+            self.chorus_control.add_chorus_audio(combined_file, combined_audio)
+            self.result_label.setText("Non-spatial chorus updated successfully.")
+        except Exception as e:
+            self.result_label.setText(f"Non-Spatial 합창음 생성 실패: {str(e)}")
+            self.chorus_control.label.setText("Failed to create chorus audio.")
 
-        if combined.max_dBFS > headroom_db:
-            gain_adjust = headroom_db - combined.max_dBFS
-            combined = combined.apply_gain(gain_adjust)
+    def update_spatial_chorus(self):
+        if not self.converted_files:
+            self.spatial_chorus_control.label.setText("No spatial chorus audio available.")
+            return
 
-        combined_file = os.path.join(tempfile.gettempdir(), "combined_chorus.wav")
-        combined.export(combined_file, format="wav")
-        self.chorus_control.add_chorus_audio(combined_file, combined)
+        try:
+            max_len = max(len(audio) for _, _, audio in self.converted_files)
+            headroom_db = -6.0
+            sr = self.converted_files[0][2].frame_rate
+            circle_positions = self.visualizer.get_circle_positions()
+            num_audios = len(self.converted_files)
+
+            max_samples = int(max_len * sr / 1000)
+            combined_samples = np.zeros((max_samples, 2), dtype=np.float32)
+
+            for file_path, target_filename, audio in self.converted_files:
+                name_without_ext = os.path.splitext(target_filename)[0]
+                if name_without_ext not in circle_positions:
+                    self.result_label.setText(f"{target_filename}에 대한 공간 좌표가 없습니다.")
+                    continue
+
+                lon, lat = circle_positions[name_without_ext]
+                volume = self.volume_values.get(file_path, 1.0)
+
+                # Load audio and apply BRIR convolution
+                audio_data, file_sr = librosa.load(file_path, sr=None, mono=True)
+                if file_sr != sr:
+                    audio_data = librosa.resample(audio_data, orig_sr=file_sr, target_sr=sr)
+
+                hrir_L, hrir_R, sr_hrir = interpolated_brir('D1_brir', [-lon, lat])
+                if sr != sr_hrir:
+                    audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=sr_hrir)
+                    sr = sr_hrir
+
+                samples = convolve_hrir(audio_data, hrir_L, hrir_R)
+                if samples.shape[0] < max_samples:
+                    samples = np.pad(samples, ((0, max_samples - samples.shape[0]), (0, 0)), mode='constant')
+                elif samples.shape[0] > max_samples:
+                    samples = samples[:max_samples, :]
+
+                combined_samples += samples * volume * 0.5 / num_audios  # 50% amplitude per audio
+
+            meter = pyln.Meter(sr)
+            loudness = meter.integrated_loudness(combined_samples.T)
+            normalized_samples = pyln.normalize.loudness(combined_samples.T, loudness, -23.0).T
+            normalized_samples = (normalized_samples * 32768).astype(np.int16)
+
+            combined_audio = AudioSegment(
+                normalized_samples.tobytes(),
+                frame_rate=sr,
+                sample_width=2,
+                channels=2
+            )
+
+            if combined_audio.max_dBFS > headroom_db:
+                gain_adjust = headroom_db - combined_audio.max_dBFS
+                combined_audio = combined_audio.apply_gain(gain_adjust)
+
+            combined_file = os.path.join(tempfile.gettempdir(), "spatial_chorus.wav")
+            combined_audio.export(combined_file, format="wav")
+            self.spatial_chorus_control.add_spatial_chorus_audio(combined_file, combined_audio)
+            self.result_label.setText("Spatial chorus updated successfully.")
+        except Exception as e:
+            self.result_label.setText(f"Spatial 합창음 생성 실패: {str(e)}")
+            self.spatial_chorus_control.label.setText("Failed to create spatial chorus audio.")
 
     def get_args(self):
-        source = self.audio_source.current_selected_path or self.source_input.text()
+        source = self.audio_source.current_selected_path
         if not source or not os.path.isfile(source):
             raise ValueError("소스 오디오 파일이 선택되지 않았거나 유효하지 않습니다.")
 
@@ -688,171 +946,132 @@ class AudioPlayer(QMainWindow):
         except Exception as e:
             raise RuntimeError(f"컨볼루션 처리 실패 ({target_filename}): {str(e)}")
 
-    def convert_and_play(self):
-        from seed_vc import inference
-        import glob
-        from pydub import AudioSegment
-
-        start_time = time.time()
-
+    def start_conversion_thread(self):
         try:
             args = self.get_args()
-            os.makedirs(args.output, exist_ok=True)
+            self.convert_button.setEnabled(False)
+            self.progress_bar.setValue(0)
+            self.result_label.setText("변환 중... 잠시 기다려주세요.")
+            self.conversion_worker = ConversionWorker(args, self)
+            self.conversion_worker.progress.connect(self.result_label.setText)
+            self.conversion_worker.progress_value.connect(self.progress_bar.setValue)
+            self.conversion_worker.finished.connect(self.on_conversion_finished)
+            self.conversion_worker.error.connect(self.on_conversion_error)
+            self.conversion_worker.start()
         except ValueError as e:
             self.result_label.setText(str(e))
-            return
 
-        try:
-            self.result_label.setText("변환 중... 잠시 기다려주세요.")
-            self.result_label.repaint()
+    def on_conversion_finished(self, converted_files, elapsed_time):
+        self.converted_files = converted_files
+        self.original_converted_files = converted_files[:]
+        self.converted_audio_list.clear()
+        self.volume_sliders.clear()
+        self.volume_values.clear()
 
-            self.converted_files = []
-            self.original_converted_files = []
-            self.converted_audio_list.clear()
-            self.volume_sliders.clear()
-            self.volume_values.clear()
+        for normalized_file, target_filename, normalized_audio in converted_files:
+            item = QListWidgetItem(f"변환됨: {target_filename}")
+            item.setData(Qt.UserRole, normalized_file)
+            self.converted_audio_list.addItem(item)
 
-            for t_path in args.targets:
-                args.target = t_path
-                target_filename = os.path.basename(t_path)
-                name_without_ext = os.path.splitext(target_filename)[0]
+            volume_label = QLabel(f"Volume: 1.00")
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 200)
+            slider.setValue(100)
+            slider.valueChanged.connect(lambda value, path=normalized_file, lbl=volume_label: self.update_volume(path, value, lbl))
+            self.volume_sliders[normalized_file] = slider
+            self.volume_values[normalized_file] = 1.0
+            slider_item = QListWidgetItem()
+            slider_widget = QWidget()
+            slider_layout = QHBoxLayout()
+            slider_layout.addWidget(QLabel(f"볼음: {target_filename}"))
+            slider_layout.addWidget(volume_label)
+            slider_layout.addWidget(slider)
+            slider_widget.setLayout(slider_layout)
+            slider_item.setSizeHint(slider_widget.sizeHint())
+            self.converted_audio_list.addItem(slider_item)
+            self.converted_audio_list.setItemWidget(slider_item, slider_widget)
 
-                try:
-                    inference(args)
-                except Exception as e:
-                    print(f"{target_filename} 변환 실패: {e}")
-                    self.result_label.setText(f"{target_filename} 변환 실패: {str(e)}")
-                    continue
-
-                output_files = glob.glob(os.path.join(args.output, "*.wav"))
-                if not output_files:
-                    self.result_label.setText(f"{target_filename}에 대한 출력 오디오 파일이 없습니다.")
-                    continue
-
-                latest_file = max(output_files, key=os.path.getmtime)
-                audio = AudioSegment.from_wav(latest_file)
-                normalized_audio = self.normalize_audio_power(audio)
-                normalized_file = os.path.join(tempfile.gettempdir(), f"normalized_{target_filename}")
-                normalized_audio.export(normalized_file, format="wav")
-
-                self.converted_files.append((normalized_file, target_filename, normalized_audio))
-                self.original_converted_files.append((normalized_file, target_filename, normalized_audio))
-
-                item = QListWidgetItem(f"변환됨: {target_filename}")
-                item.setData(Qt.UserRole, normalized_file)
-                self.converted_audio_list.addItem(item)
-
-                slider = QSlider(Qt.Horizontal)
-                slider.setRange(0, 200)
-                slider.setValue(100)
-                slider.valueChanged.connect(lambda value, path=normalized_file: self.update_volume(path, value))
-                self.volume_sliders[normalized_file] = slider
-                self.volume_values[normalized_file] = 1.0
-                slider_item = QListWidgetItem()
-                slider_widget = QWidget()
-                slider_layout = QHBoxLayout()
-                slider_layout.addWidget(QLabel(f"볼륨: {target_filename}"))
-                slider_layout.addWidget(slider)
-                slider_widget.setLayout(slider_layout)
-                slider_item.setSizeHint(slider_widget.sizeHint())
-                self.converted_audio_list.addItem(slider_item)
-                self.converted_audio_list.setItemWidget(slider_item, slider_widget)
-
-            if not self.converted_files:
-                self.result_label.setText("변환된 오디오 파일이 없습니다.")
-                return
-
-            end_time = time.time()
-            elapsed_time = end_time - start_time
-
-            first_file, first_target, _ = self.converted_files[0]
+        self.convert_button.setEnabled(True)
+        self.progress_bar.setValue(100)
+        if converted_files:
+            first_file, first_target, _ = converted_files[0]
             self.converted_path = first_file
             self.converted_player.setMedia(QMediaContent(QUrl.fromLocalFile(first_file)))
             self.converted_player.play()
             self.result_label.setText(f"재생 중: 변환된 {first_target} (소요 시간: {elapsed_time:.2f}초)")
             self.spatial_button.setEnabled(True)
             self.save_button.setEnabled(True)
-
-        except Exception as e:
-            end_time = time.time()
-            elapsed_time = end_time - start_time
-            self.result_label.setText(f"일반 오류: {str(e)} (소요 시간: {elapsed_time:.2f}초)")
+            self.update_non_spatial_chorus()
+        else:
+            self.result_label.setText(f"변환된 오디오 파일이 없습니다. (소요 시간: {elapsed_time:.2f}초)")
             self.spatial_button.setEnabled(False)
             self.save_button.setEnabled(False)
 
-    def apply_spatial_audio(self):
-        start_time = time.time()
+        self.save_spatial_button.setEnabled(False)
 
-        try:
-            self.result_label.setText("공간 음향 적용 중... 잠시 기다려주세요.")
-            self.result_label.repaint()
+    def on_conversion_error(self, error_message):
+        self.convert_button.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.result_label.setText(error_message)
+        self.spatial_button.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.save_spatial_button.setEnabled(False)
 
-            circle_positions = self.visualizer.get_circle_positions()
-            new_converted_files = []
+    def start_spatial_audio_thread(self):
+        circle_positions = self.visualizer.get_circle_positions()
+        self.spatial_button.setEnabled(False)
+        self.result_label.setText("공간 음향 적용 중... 잠시 기다려주세요.")
+        self.spatial_worker = SpatialAudioWorker(self.original_converted_files, circle_positions, self)
+        self.spatial_worker.progress.connect(self.result_label.setText)
+        self.spatial_worker.finished.connect(self.on_spatial_audio_finished)
+        self.spatial_worker.error.connect(self.on_spatial_audio_error)
+        self.spatial_worker.start()
 
-            self.converted_audio_list.clear()
-            self.volume_sliders.clear()
-            self.volume_values.clear()
+    def on_spatial_audio_finished(self, new_converted_files, elapsed_time):
+        self.converted_files = new_converted_files
+        self.converted_audio_list.clear()
+        self.volume_sliders.clear()
+        self.volume_values.clear()
 
-            for normalized_file, target_filename, normalized_audio in self.original_converted_files:
-                name_without_ext = os.path.splitext(target_filename)[0]
-                if name_without_ext not in circle_positions:
-                    self.result_label.setText(f"{target_filename}에 대한 좌표가 없습니다.")
-                    continue
+        for convolved_file, target_filename, convolved_audio in new_converted_files:
+            item = QListWidgetItem(f"변환됨: {target_filename} (lon: {self.visualizer.get_circle_positions()[os.path.splitext(target_filename)[0]][0]:.2f}, lat: {self.visualizer.get_circle_positions()[os.path.splitext(target_filename)[0]][1]:.2f})")
+            item.setData(Qt.UserRole, convolved_file)
+            self.converted_audio_list.addItem(item)
 
-                lon, lat = circle_positions[name_without_ext]
-                audio_data, sr = librosa.load(normalized_file, sr=None, mono=True)
-                convolved_file, convolved_signal = self.apply_brir_convolution(audio_data, sr, lon, lat, target_filename)
-                convolved_audio = AudioSegment.from_wav(convolved_file)
+            volume_label = QLabel(f"Volume: 1.00")
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 200)
+            slider.setValue(100)
+            slider.valueChanged.connect(lambda value, path=convolved_file, lbl=volume_label: self.update_volume(path, value, lbl))
+            self.volume_sliders[convolved_file] = slider
+            self.volume_values[convolved_file] = 1.0
+            slider_item = QListWidgetItem()
+            slider_widget = QWidget()
+            slider_layout = QHBoxLayout()
+            slider_layout.addWidget(QLabel(f"볼음: {target_filename}"))
+            slider_layout.addWidget(volume_label)
+            slider_layout.addWidget(slider)
+            slider_widget.setLayout(slider_layout)
+            slider_item.setSizeHint(slider_widget.sizeHint())
+            self.converted_audio_list.addItem(slider_item)
+            self.converted_audio_list.setItemWidget(slider_item, slider_widget)
 
-                new_converted_files.append((convolved_file, target_filename, convolved_audio))
+        self.spatial_button.setEnabled(True)
+        self.save_spatial_button.setEnabled(bool(new_converted_files))
+        self.update_spatial_chorus()
+        self.result_label.setText(f"공간 음향 적용 완료 (소요 시간: {elapsed_time:.2f}초)")
 
-                item = QListWidgetItem(f"변환됨: {target_filename} (lon: {lon:.2f}, lat: {lat:.2f})")
-                item.setData(Qt.UserRole, convolved_file)
-                self.converted_audio_list.addItem(item)
+    def on_spatial_audio_error(self, error_message):
+        self.spatial_button.setEnabled(True)
+        self.save_spatial_button.setEnabled(False)
+        self.result_label.setText(error_message)
 
-                slider = QSlider(Qt.Horizontal)
-                slider.setRange(0, 200)
-                slider.setValue(100)
-                slider.valueChanged.connect(lambda value, path=convolved_file: self.update_volume(path, value))
-                self.volume_sliders[convolved_file] = slider
-                self.volume_values[convolved_file] = 1.0
-                slider_item = QListWidgetItem()
-                slider_widget = QWidget()
-                slider_layout = QHBoxLayout()
-                slider_layout.addWidget(QLabel(f"볼륨: {target_filename}"))
-                slider_layout.addWidget(slider)
-                slider_widget.setLayout(slider_layout)
-                slider_item.setSizeHint(slider_widget.sizeHint())
-                self.converted_audio_list.addItem(slider_item)
-                self.converted_audio_list.setItemWidget(slider_item, slider_widget)
-
-            if not new_converted_files:
-                end_time = time.time()
-                elapsed_time = end_time - start_time
-                self.result_label.setText(f"공간 음향이 적용된 오디오 파일이 없습니다. (소요 시간: {elapsed_time:.2f}초)")
-                return
-
-            self.converted_files = new_converted_files
-            self.update_chorus()
-
-            end_time = time.time()
-            elapsed_time = end_time - start_time
-            self.result_label.setText(f"공간 음향 적용 완료 (소요 시간: {elapsed_time:.2f}초)")
-
-        except Exception as e:
-            end_time = time.time()
-            elapsed_time = end_time - start_time
-            self.result_label.setText(f"공간 음향 적용 오류: {str(e)} (소요 시간: {elapsed_time:.2f}초)")
-
-    def update_volume(self, file_path, value):
-        self.volume_values[file_path] = value / 100.0
-        self.update_chorus()
-
-    def update_chorus_volume(self):
-        chorus_volume = self.chorus_volume_slider.value() / 100.0
-        self.chorus_volume_label.setText(f"코러스 볼륨: {chorus_volume:.2f}")
-        self.update_chorus()
+    def update_volume(self, file_path, value, volume_label):
+        volume = value / 100.0
+        self.volume_values[file_path] = volume
+        volume_label.setText(f"Volume: {volume:.2f}")
+        self.update_non_spatial_chorus()
+        self.update_spatial_chorus()
 
     def play_selected_converted_audio(self, item):
         file_path = item.data(Qt.UserRole)
@@ -863,18 +1082,20 @@ class AudioPlayer(QMainWindow):
             self.result_label.setText(f"재생 중: {item.text()}")
 
     def save_audio(self):
-        if not self.converted_files and not self.chorus_control.chorus_files:
+        if not self.original_converted_files and not self.chorus_control.audio_path:
             self.result_label.setText("저장할 오디오가 없습니다.")
             return
 
-        source_name = os.path.splitext(os.path.basename(self.audio_source.current_selected_path or self.source_input.text()))[0]
+        source_name = os.path.splitext(os.path.basename(self.audio_source.current_selected_path or "source"))[0]
         date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         selected_items = self.converted_audio_list.selectedItems()
         if selected_items:
             for item in selected_items:
                 file_path = item.data(Qt.UserRole)
+                # Find the corresponding non-spatial file
                 target_name = os.path.splitext(item.text().replace("변환됨: ", ""))[0]
+                non_spatial_file = next((f for f, t, _ in self.original_converted_files if t == target_name), file_path)
                 params = f"diff{self.diffusion_steps_input.value()}_len{self.length_adjust_input.value()}_cfg{self.inference_cfg_input.value()}"
                 if self.f0_condition_input.isChecked():
                     params += "_f0"
@@ -886,7 +1107,7 @@ class AudioPlayer(QMainWindow):
                 save_path, _ = QFileDialog.getSaveFileName(self, "변환된 오디오 저장", default_name, "WAV Files (*.wav)")
                 if save_path:
                     try:
-                        with open(file_path, 'rb') as src, open(save_path, 'wb') as dst:
+                        with open(non_spatial_file, 'rb') as src, open(save_path, 'wb') as dst:
                             dst.write(src.read())
                         self.result_label.setText(f"저장됨: {save_path}")
                     except Exception as e:
@@ -895,7 +1116,7 @@ class AudioPlayer(QMainWindow):
             save_dir = QFileDialog.getExistingDirectory(self, "모든 오디오를 저장할 디렉토리 선택")
             if save_dir:
                 try:
-                    for file_path, target_name, _ in self.converted_files:
+                    for file_path, target_name, _ in self.original_converted_files:
                         params = f"diff{self.diffusion_steps_input.value()}_len{self.length_adjust_input.value()}_cfg{self.inference_cfg_input.value()}"
                         if self.f0_condition_input.isChecked():
                             params += "_f0"
@@ -907,7 +1128,7 @@ class AudioPlayer(QMainWindow):
                         save_path = os.path.join(save_dir, base_name)
                         with open(file_path, 'rb') as src, open(save_path, 'wb') as dst:
                             dst.write(src.read())
-                    for file_path in self.chorus_control.chorus_files:
+                    if self.chorus_control.audio_path:
                         params = f"diff{self.diffusion_steps_input.value()}_len{self.length_adjust_input.value()}_cfg{self.inference_cfg_input.value()}"
                         if self.f0_condition_input.isChecked():
                             params += "_f0"
@@ -915,11 +1136,72 @@ class AudioPlayer(QMainWindow):
                             params += "_autof0"
                         if self.semitone_shift_input.value() != 0:
                             params += f"_semi{self.semitone_shift_input.value()}"
-                        base_name = f"{source_name}-chorus-{params}-{date_str}.wav"
+                        base_name = f"{source_name}-non_spatial_chorus-{params}-{date_str}.wav"
+                        save_path = os.path.join(save_dir, base_name)
+                        with open(self.chorus_control.audio_path, 'rb') as src, open(save_path, 'wb') as dst:
+                            dst.write(src.read())
+                    self.result_label.setText(f"모든 오디오 저장됨: {save_dir}")
+                except Exception as e:
+                    self.result_label.setText(f"저장 실패: {str(e)}")
+
+    def save_spatial_audio(self):
+        if not self.converted_files and not self.spatial_chorus_control.audio_path:
+            self.result_label.setText("저장할 공간 오디오가 없습니다.")
+            return
+
+        source_name = os.path.splitext(os.path.basename(self.audio_source.current_selected_path or "source"))[0]
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        selected_items = self.converted_audio_list.selectedItems()
+        if selected_items:
+            for item in selected_items:
+                file_path = item.data(Qt.UserRole)
+                target_name = os.path.splitext(item.text().replace("변환됨: ", ""))[0]
+                params = f"diff{self.diffusion_steps_input.value()}_len{self.length_adjust_input.value()}_cfg{self.inference_cfg_input.value()}_spatial"
+                if self.f0_condition_input.isChecked():
+                    params += "_f0"
+                if self.auto_f0_adjust_input.isChecked():
+                    params += "_autof0"
+                if self.semitone_shift_input.value() != 0:
+                    params += f"_semi{self.semitone_shift_input.value()}"
+                default_name = f"{source_name}-{target_name}-{params}-{date_str}.wav"
+                save_path, _ = QFileDialog.getSaveFileName(self, "공간 오디오 저장", default_name, "WAV Files (*.wav)")
+                if save_path:
+                    try:
+                        with open(file_path, 'rb') as src, open(save_path, 'wb') as dst:
+                            dst.write(src.read())
+                        self.result_label.setText(f"저장됨: {save_path}")
+                    except Exception as e:
+                        self.result_label.setText(f"저장 실패: {str(e)}")
+        else:
+            save_dir = QFileDialog.getExistingDirectory(self, "모든 공간 오디오를 저장할 디렉토리 선택")
+            if save_dir:
+                try:
+                    for file_path, target_name, _ in self.converted_files:
+                        params = f"diff{self.diffusion_steps_input.value()}_len{self.length_adjust_input.value()}_cfg{self.inference_cfg_input.value()}_spatial"
+                        if self.f0_condition_input.isChecked():
+                            params += "_f0"
+                        if self.auto_f0_adjust_input.isChecked():
+                            params += "_autof0"
+                        if self.semitone_shift_input.value() != 0:
+                            params += f"_semi{self.semitone_shift_input.value()}"
+                        base_name = f"{source_name}-{target_name}-{params}-{date_str}.wav"
                         save_path = os.path.join(save_dir, base_name)
                         with open(file_path, 'rb') as src, open(save_path, 'wb') as dst:
                             dst.write(src.read())
-                    self.result_label.setText(f"모든 오디오가 저장됨: {save_dir}")
+                    if self.spatial_chorus_control.audio_path:
+                        params = f"diff{self.diffusion_steps_input.value()}_len{self.length_adjust_input.value()}_cfg{self.inference_cfg_input.value()}_spatial"
+                        if self.f0_condition_input.isChecked():
+                            params += "_f0"
+                        if self.auto_f0_adjust_input.isChecked():
+                            params += "_autof0"
+                        if self.semitone_shift_input.value() != 0:
+                            params += f"_semi{self.semitone_shift_input.value()}"
+                        base_name = f"{source_name}-spatial_chorus-{params}-{date_str}.wav"
+                        save_path = os.path.join(save_dir, base_name)
+                        with open(self.spatial_chorus_control.audio_path, 'rb') as src, open(save_path, 'wb') as dst:
+                            dst.write(src.read())
+                    self.result_label.setText(f"모든 공간 오디오 저장됨: {save_dir}")
                 except Exception as e:
                     self.result_label.setText(f"저장 실패: {str(e)}")
 
